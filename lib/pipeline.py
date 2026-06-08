@@ -546,11 +546,18 @@ def main():
             if cfg.get("burn"):
                 wsrt = os.path.join(workdir, "subs.srt"); write_srt(cues, wsrt)
                 log("burning captions into video (white text, black bg)…")
-                if not burn(video, track, wsrt, cfg["out"], orig_vol=orig_vol):
+                try:
+                    if not burn(video, track, wsrt, cfg["out"], orig_vol=orig_vol):
+                        raise RuntimeError("no libass")
+                except Exception as ex:
+                    log(f"⚠ burn failed ({ex}), falling back to mux + .srt")
                     out_srt = os.path.splitext(cfg["out"])[0] + ".srt"
                     write_srt(cues, out_srt)
-                    mux(video, track, cfg["out"], orig_vol=orig_vol)
-                    log("note: ffmpeg without libass — wrote .srt instead of burning.")
+                    try:
+                        mux(video, track, cfg["out"], orig_vol=orig_vol)
+                    except Exception:
+                        log("⚠ audio mix also failed, using simple mux")
+                        mux(video, track, cfg["out"], orig_vol=0.0)
             else:
                 mux(video, track, cfg["out"], orig_vol=orig_vol)
         else:
