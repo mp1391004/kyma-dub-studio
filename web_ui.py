@@ -513,5 +513,6 @@ def serve_video(job_id):
     return send_file(out, mimetype="video/mp4", as_attachment=False)
 
 if __name__ == "__main__":
-    print("\n  Kyma Dub Studio  ->  http://localhost:7860\n")
-    app.run(host="0.0.0.0", port=7860, debug=False)
+    port = int(os.environ.get("PORT", 7860))
+    print(f"\n  Kyma Dub Studio  ->  http://localhost:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False)
