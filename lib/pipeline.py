@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+dub-cli pipeline — time-aligned AI video dubbing.
+
+Flow:
+  extract audio -> transcribe(+timestamps) -> chunk by speech pauses
+  -> translate each chunk fitted to its duration -> TTS (locked engine,
+  fallback chain) -> fit each clip to its slot -> reassemble on the
+  original timeline (silences preserved) -> mux into the source video.
+
+Invoked by bin/dub:  python3 pipeline.py <config.json>
+
+Routing (see lib/env.sh):
+  transcribe + translate  -> Kyma (dogfood) or Groq direct for STT
+  TTS engine chain (locked once at job start to keep one voice):
+    1 eleven_v3      ElevenLabs direct, expressive   [voice preserved]
+    2 eleven_v2      ElevenLabs direct, stable        [voice preserved]
+    3 kyma_eleven    Kyma -> eleven-multilingual-v2   [voice preserved]
+    4 kyma_minimax   Kyma -> minimax-speech-hd        [VOICE CHANGES — opt-in]
+  Layers 1-3 share the ElevenLabs upstream; only layer 4 is a truly
+  independent provider, so it only runs with allow_voice_fallback=true.
+"""
+import sys, os, json, re, subprocess, tempfile, shutil, urllib.request, urllib.error, asyncio
+import bilingual as bl
+
+# friendly voice name -> ElevenLabs voice id
+VOICES = {
+    "charlie": "IKne3meq5aSn9XLyUdCD",  # young, casual (default)
+    "will":    "bIHbv24MWmeRgasZH58o",  # young, friendly
+    "liam":    "TX3LPaxmHKxFdv7VOQHJ",  # young narration
+    "brian":   "nPczCjzI2devNBz1zQrb",  # mature narration
+    "rachel":  "21m00Tcm4TlvDq8ikWAM",  # warm female
+    "adam":    "pNInz6obpgDQGcFmaJgB",  # deep male
+    "jessica": "cgSgspJ2msm6clMCkdW9",  # young female, expressive
+}
+MINIMAX_FALLBACK_VOICE = "English_expressive_narrator"
+
+LANG_NAMES = {"en": "English", "vi": "Vietnamese", "es": "Spanish", "fr": "French",
+              "de": "German", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+              "pt": "Portuguese", "it": "Italian", "hi": "Hindi", "id": "Indonesian"}
+
+# Natural speaking rate in characters/second at speed 1.0, by language.
+# Logographic scripts pack ~1 syllable/char -> far fewer chars/sec; long-
+# compound languages sit lower than Latin scripts. (Same model as echoly.)
+SPEECH_CPS = {"zh": 5, "ja": 5, "ko": 5, "th": 6, "de": 13}
+DEFAULT_CPS = 15  # en, vi, es, fr, pt, id, it, hi, ...
+
+def chars_per_sec(lang):
+    return SPEECH_CPS.get((lang or "").lower().split("-")[0], DEFAULT_CPS)
+
+# Isochrony: speed UP to fit a slot, and allow a GENTLE slow-down (down to
+# 0.9x — imperceptible) to fill small gaps so continuous speech doesn't sound
+# stop-start. Below 0.9 it drags, so the rest stays as a (now smaller) pause.
+MIN_SPEED = 0.9
+DEFAULT_MAX_SPEED = 1.5
+
+
+def log(m): print(f"[kyma-dub] {m}", file=sys.stderr, flush=True)
+def die(m, code=1): log("error: " + m); sys.exit(code)
+def ffprobe_dur(f):
+    return float(subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", f]).strip())
+def ff(args):
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args,
+                   check=True)
+
+
+# ── HTTP helpers ────────────────────────────────────────────────────
+def _http_json(url, body, headers, timeout=240):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+def _http_bytes(url, body, headers, timeout=180):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+# ── 1. extract audio ────────────────────────────────────────────────
+def extract_audio(video, workdir):
+    out = os.path.join(workdir, "src.mp3")
+    ff(["-i", video, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", out])
+    return out
+
+
+# ── 2. transcribe with timestamps ───────────────────────────────────
+def transcribe(cfg, audio):
+    if cfg["mode"] == "kyma":
+        endpoint = cfg["kyma_base"] + "/v1/audio/transcriptions"
+        auth = "Bearer " + cfg["kyma_key"]; model = "whisper-v3-turbo"
+    else:
+        endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
+        auth = "Bearer " + cfg["groq_key"]; model = "whisper-large-v3"
+    # curl handles multipart + the explicit MIME type Kyma requires.
+    args = ["curl", "-sS", "-X", "POST", "-H", "Authorization: " + auth,
+            "-H", "User-Agent: " + cfg["ua"],
+            "-F", f"file=@{audio};type=audio/mpeg",
+            "-F", "model=" + model, "-F", "response_format=verbose_json"]
+    if cfg.get("source_lang") and cfg["source_lang"] != "auto":
+        args += ["-F", "language=" + cfg["source_lang"]]
+    args += [endpoint]
+    out = subprocess.check_output(args)
+    d = json.loads(out)
+    if "segments" not in d or not d["segments"]:
+        die("transcription returned no segments: " + out.decode()[:200])
+    return d["segments"], d.get("language", cfg.get("source_lang", "?"))
+
+
+# ── 3. chunk by natural speech pauses ───────────────────────────────
+def chunk_segments(segments, max_dur=22.0, gap_break=1.0, min_dur=8.0):
+    # Fewer, larger chunks pack the voice continuously and leave little
+    # dead air (smaller chunks scatter trailing silence -> feels laggy).
+    chunks, cur = [], None
+    for s in segments:
+        st, en, tx = float(s["start"]), float(s["end"]), s["text"].strip()
+        if not tx:
+            continue
+        if cur is None:
+            cur = {"start": st, "end": en, "vi": tx}; continue
+        gap = st - cur["end"]; dur = cur["end"] - cur["start"]
+        if (dur >= min_dur and gap >= gap_break) or (en - cur["start"]) > max_dur:
+            chunks.append(cur); cur = {"start": st, "end": en, "vi": tx}
+        else:
+            cur["end"] = en; cur["vi"] += " " + tx
+    if cur:
+        chunks.append(cur)
+    for i, c in enumerate(chunks):
+        c["i"] = i; c["dur"] = round(c["end"] - c["start"], 2)
+    return chunks
+
+
+# ── 4. translate, fitted to each chunk's duration ───────────────────
+def translate(cfg, chunks):
+    src = LANG_NAMES.get(cfg["source_lang"], cfg["source_lang"])
+    tgt = LANG_NAMES.get(cfg["target_lang"], cfg["target_lang"])
+    cps = chars_per_sec(cfg["target_lang"])
+    # Per-chunk budget the model must fit: a max_seconds slot plus a soft
+    # character ceiling derived from the target language's speaking rate.
+    # Seconds is the language-agnostic contract; char ceiling guides verbose
+    # vs dense scripts (CJK get far fewer chars than Latin for the same time).
+    brief = [{"i": c["i"], "max_seconds": c["dur"],
+              "max_chars": int(round(c["dur"] * cps)),
+              "source_text": c["vi"]} for c in chunks]
+    sysp = (
+        f"You are a professional dubbing translator. Translate a {src} transcript "
+        f"(auto-transcribed) into {tgt} for spoken voice-over, chunk by chunk.\n"
+        "FAITHFULNESS — THE MOST IMPORTANT RULE: translate ONLY what the source says. "
+        "NEVER add, invent, infer, embellish, or 'improve' any fact, name, place, brand, "
+        "number, institution, title, or claim that is not explicitly in the source. The "
+        "transcript may be garbled by speech-recognition errors — when a word is unclear, "
+        "mistranscribed, or generic, render it with a GENERIC term (e.g. 'abroad', 'over "
+        "there', 'a school') or omit it. NEVER substitute a specific proper noun (city, "
+        "university, company, person) for an unclear or generic word — do not guess "
+        "'Stanford' or 'San Francisco' from ambiguous audio. Accuracy over fluency.\n"
+        "PACING: the speaker talks continuously, so each chunk should fill close to its "
+        "max_seconds when spoken at a natural pace — translate the FULL meaning, do NOT "
+        "compress, summarize, or shorten to leave silence. Only trim if the text would "
+        "clearly overflow max_seconds (then stay at or under max_chars).\n"
+        "STYLE: keep first person if the source is; natural spoken {tgt} with contractions "
+        "and natural rhythm (commas, occasional pauses). Keep names, numbers, and technical "
+        "terms exactly as in the source. Preserve any ordering/numbering.\n"
+        'OUTPUT: JSON {"chunks":[{"i":<index>,"text":"<translated>"}, ...]} in the same '
+        "order, one per input chunk. Output ONLY the JSON.")
+    body = {"model": cfg["translate_model"], "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": sysp},
+                         {"role": "user", "content": "Chunks:\n\n" + json.dumps(brief, ensure_ascii=False)}]}
+    if cfg.get("groq_key") and not cfg.get("kyma_key"):
+        endpoint = "https://api.groq.com/openai/v1/chat/completions"
+        auth_key = cfg["groq_key"]
+        body["model"] = "llama-3.3-70b-versatile"
+    else:
+        endpoint = cfg["kyma_base"] + "/v1/chat/completions"
+        auth_key = cfg["kyma_key"]
+    headers = {"Authorization": "Bearer " + auth_key, "Content-Type": "application/json",
+               "User-Agent": cfg["ua"]}
+    r = _http_json(endpoint, body, headers)
+    raw = r["choices"][0]["message"]["content"].strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip()
+    data = json.loads(raw)
+    arr = data["chunks"] if isinstance(data, dict) and "chunks" in data else (
+        data if isinstance(data, list) else next(v for v in data.values() if isinstance(v, list)))
+    en = {o["i"]: o["text"] for o in arr}
+    for c in chunks:
+        c["en"] = en.get(c["i"], "")
+        if not c["en"]:
+            die(f"chunk {c['i']} got no translation")
+    log(f"translated {len(chunks)} chunks via {r.get('model', cfg['translate_model'])}")
+    return chunks
+
+
+# ── 5. TTS engine chain (locked once, fallback) ─────────────────────
+def tts_bytes(cfg, engine, text):
+    if engine in ("eleven_v3", "eleven_v2"):
+        model = "eleven_v3" if engine == "eleven_v3" else "eleven_multilingual_v2"
+        headers = {"xi-api-key": cfg["eleven_key"], "Content-Type": "application/json",
+                   "Accept": "audio/mpeg", "User-Agent": cfg["ua"]}
+        body = {"text": text, "model_id": model,
+                "voice_settings": {"stability": 0.4, "similarity_boost": 0.8,
+                                   "use_speaker_boost": True}}
+        return _http_bytes(f"https://api.elevenlabs.io/v1/text-to-speech/{cfg['voice_id']}", body, headers)
+    if engine in ("kyma_v3", "kyma_eleven"):
+        model = "eleven-v3" if engine == "kyma_v3" else "eleven-multilingual-v2"
+        headers = {"Authorization": "Bearer " + cfg["kyma_key"], "Content-Type": "application/json",
+                   "User-Agent": cfg["ua"]}
+        body = {"model": model, "input": text, "voice": cfg["voice_id"]}
+        return _http_bytes(cfg["kyma_base"] + "/v1/audio/speech", body, headers)
+    if engine == "kyma_minimax":
+        headers = {"Authorization": "Bearer " + cfg["kyma_key"], "Content-Type": "application/json",
+                   "User-Agent": cfg["ua"]}
+        body = {"model": "minimax-speech-hd", "input": text, "voice": cfg["minimax_voice"]}
+        return _http_bytes(cfg["kyma_base"] + "/v1/audio/speech", body, headers)
+    raise ValueError("unknown engine " + engine)
+
+
+# edge-tts voices: map friendly name + lang -> Microsoft Neural voice
+EDGE_VOICES = {
+    "charlie": {"en": "en-US-GuyNeural",    "vi": "vi-VN-NamMinhNeural", "es": "es-ES-AlvaroNeural",
+                "fr": "fr-FR-HenriNeural",  "de": "de-DE-ConradNeural",  "ja": "ja-JP-KeitaNeural",
+                "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunxiNeural",  "pt": "pt-BR-AntonioNeural",
+                "id": "id-ID-ArdiNeural"},
+    "will":    {"en": "en-US-BrianNeural",  "vi": "vi-VN-NamMinhNeural", "es": "es-MX-JorgeNeural",
+                "fr": "fr-FR-HenriNeural",  "de": "de-DE-ConradNeural",  "ja": "ja-JP-KeitaNeural",
+                "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunxiNeural",  "pt": "pt-BR-AntonioNeural",
+                "id": "id-ID-ArdiNeural"},
+    "liam":    {"en": "en-US-AndrewNeural", "vi": "vi-VN-NamMinhNeural", "es": "es-ES-AlvaroNeural",
+                "fr": "fr-FR-HenriNeural",  "de": "de-DE-ConradNeural",  "ja": "ja-JP-KeitaNeural",
+                "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunxiNeural",  "pt": "pt-BR-AntonioNeural",
+                "id": "id-ID-ArdiNeural"},
+    "brian":   {"en": "en-GB-RyanNeural",   "vi": "vi-VN-NamMinhNeural", "es": "es-ES-AlvaroNeural",
+                "fr": "fr-FR-HenriNeural",  "de": "de-DE-ConradNeural",  "ja": "ja-JP-KeitaNeural",
+                "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunhaoNeural", "pt": "pt-PT-DuarteNeural",
+                "id": "id-ID-ArdiNeural"},
+    "rachel":  {"en": "en-US-JennyNeural",  "vi": "vi-VN-HoaiMyNeural", "es": "es-ES-ElviraNeural",
+                "fr": "fr-FR-DeniseNeural", "de": "de-DE-KatjaNeural",   "ja": "ja-JP-NanamiNeural",
+                "ko": "ko-KR-SunHiNeural",  "zh": "zh-CN-XiaoxiaoNeural","pt": "pt-BR-FranciscaNeural",
+                "id": "id-ID-GadisNeural"},
+    "adam":    {"en": "en-US-ChristopherNeural","vi": "vi-VN-NamMinhNeural","es": "es-ES-AlvaroNeural",
+                "fr": "fr-FR-HenriNeural",  "de": "de-DE-ConradNeural",  "ja": "ja-JP-KeitaNeural",
+                "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunxiNeural",  "pt": "pt-BR-AntonioNeural",
+                "id": "id-ID-ArdiNeural"},
+    "jessica": {"en": "en-US-AriaNeural",   "vi": "vi-VN-HoaiMyNeural", "es": "es-ES-ElviraNeural",
+                "fr": "fr-FR-DeniseNeural", "de": "de-DE-KatjaNeural",   "ja": "ja-JP-NanamiNeural",
+                "ko": "ko-KR-SunHiNeural",  "zh": "zh-CN-XiaoxiaoNeural","pt": "pt-BR-FranciscaNeural",
+                "id": "id-ID-GadisNeural"},
+}
+
+def _edge_voice_name(cfg):
+    lang = cfg.get("target_lang", "en").lower()
+    voice = cfg.get("voice", "charlie").lower()
+    table = EDGE_VOICES.get(voice, EDGE_VOICES["charlie"])
+    return table.get(lang, table.get("en", "en-US-GuyNeural"))
+
+async def _edge_tts_async(text, voice, out_mp3):
+    import edge_tts
+    comm = edge_tts.Communicate(text, voice)
+    await comm.save(out_mp3)
+
+def tts_edge(cfg, text, out_mp3):
+    voice = _edge_voice_name(cfg)
+    asyncio.run(_edge_tts_async(text, voice, out_mp3))
+
+
+def build_engine_chain(cfg):
+    chain = []
+    if cfg["tts"] == "kyma":  # default — dogfood everything on one Kyma key
+        if cfg.get("kyma_key"):
+            chain += ["kyma_v3", "kyma_eleven"]    # v3 via Kyma, then v2 via Kyma
+        if cfg.get("eleven_key"):
+            chain += ["eleven_v3", "eleven_v2"]    # direct as deep fallback if Kyma TTS down
+    else:  # elevenlabs — TTS straight to ElevenLabs
+        if cfg.get("eleven_key"):
+            chain += ["eleven_v3", "eleven_v2"]
+        if cfg.get("kyma_key"):
+            chain += ["kyma_v3", "kyma_eleven"]
+    # voice-changing last resort, opt-in only (independent provider)
+    if cfg.get("allow_voice_fallback") and cfg.get("kyma_key"):
+        chain += ["kyma_minimax"]
+    # edge-tts: free fallback, always available
+    chain += ["edge"]
+    return chain
+
+
+def lock_engine(cfg):
+    chain = build_engine_chain(cfg)
+    if not chain:
+        die("no TTS engine available (need ELEVENLABS_API_KEY or KYMA_API_KEY)")
+    for e in chain:
+        try:
+            if e == "edge":
+                tmp = tempfile.mktemp(suffix=".mp3")
+                tts_edge(cfg, "Testing, one two three.", tmp)
+                ok = os.path.exists(tmp) and os.path.getsize(tmp) > 500
+                try: os.unlink(tmp)
+                except: pass
+                if ok:
+                    log(f"TTS engine locked = edge-tts (voice '{_edge_voice_name(cfg)}')")
+                    return e
+            else:
+                b = tts_bytes(cfg, e, "Testing, one two three.")
+                if b and len(b) > 1000:
+                    if e == "kyma_minimax":
+                        log(f"⚠ TTS engine locked = {e}: VOICE WILL DIFFER from '{cfg['voice']}' "
+                            "(independent provider, ElevenLabs unavailable).")
+                    else:
+                        log(f"TTS engine locked = {e} (voice '{cfg['voice']}' preserved)")
+                    return e
+        except urllib.error.HTTPError as ex:
+            log(f"engine {e} unavailable (HTTP {ex.code}) — trying next")
+        except Exception as ex:
+            log(f"engine {e} unavailable ({ex}) — trying next")
+    die("every TTS engine in the chain failed.")
+
+
+def synth_chunk(cfg, engine, text, out_mp3, retries=2):
+    if engine == "edge":
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                tts_edge(cfg, text, out_mp3)
+                if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 500:
+                    return
+                last = "empty audio"
+            except Exception as ex:
+                last = str(ex)
+        die(f"edge-tts failed after {retries+1} tries ({last}).")
+        return
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            b = tts_bytes(cfg, engine, text)
+            if b and len(b) > 500:
+                open(out_mp3, "wb").write(b); return
+            last = "empty audio"
+        except Exception as ex:
+            last = str(ex)
+    die(f"locked engine '{engine}' failed on a chunk after {retries+1} tries ({last}). "
+        "Refusing to swap voice mid-video.")
+
+
+# ── 6. fit each clip — speed UP only, never slow ────────────────────
+def speed_fit(raw, slot, max_speed, out_wav):
+    """Resample so spoken length fits the slot, but only by speeding up
+    (>=1.0). Shorter-than-slot audio is left alone — the gap becomes a
+    natural pause in assembly. Returns (speed, spoken_seconds)."""
+    cd = ffprobe_dur(raw)
+    speed = min(max_speed, max(MIN_SPEED, cd / slot if slot > 0 else MIN_SPEED))
+    if abs(speed - 1.0) < 0.01:
+        ff(["-i", raw, "-ar", "44100", "-ac", "2", out_wav])
+        return 1.0, cd
+    ff(["-i", raw, "-filter:a", f"atempo={speed:.4f}", "-ar", "44100", "-ac", "2", out_wav])
+    return speed, ffprobe_dur(out_wav)
+
+
+# ── 7. reassemble on the original timeline ──────────────────────────
+def _silence(workdir, idx, secs):
+    sil = os.path.join(workdir, f"sil_{idx}.wav")
+    ff(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{secs:.3f}", sil])
+    return sil
+
+def assemble(chunks, total_dur, workdir):
+    # Anchor each clip at its start time; if the previous clip overran its
+    # slot (dense speech sped to the cap), push this one later instead of
+    # overlapping. Leftover time between clips is silence — no dragging.
+    parts, prev_end, overrun = [], 0.0, 0.0
+    for c in chunks:
+        pos = max(c["start"], prev_end)
+        c["pos"] = pos   # actual placed start, for dub-synced subtitles
+        gap = pos - prev_end
+        if gap > 0.02:
+            parts.append(_silence(workdir, c["i"], gap))
+        elif pos > c["start"] + 0.05:
+            overrun += pos - c["start"]
+        parts.append(c["fit"])
+        prev_end = pos + c["spoken"]
+    if total_dur - prev_end > 0.02:
+        parts.append(_silence(workdir, "tail", total_dur - prev_end))
+    if overrun > 0.3:
+        log(f"⚠ {overrun:.1f}s of cumulative push from dense chunks (sped to the cap). "
+            "Raise --max-speed or let the translation be more concise to tighten sync.")
+    listf = os.path.join(workdir, "concat.txt")
+    with open(listf, "w") as fh:
+        for p in parts:
+            fh.write(f"file '{p}'\n")
+    track = os.path.join(workdir, "track.mp3")
+    ff(["-f", "concat", "-safe", "0", "-i", listf, "-c:a", "libmp3lame", "-q:a", "2", track])
+    return track
+
+
+# ── 8. subtitles (timed to the DUB, so they match the new audio) ────
+def _split_lines(text, max_chars=84):
+    text = text.strip()
+    out = []
+    for s in re.split(r"(?<=[.!?…])\s+", text):
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) <= max_chars:
+            out.append(s)
+        else:  # split a long sentence at word boundaries
+            cur = ""
+            for w in s.split():
+                if cur and len(cur) + 1 + len(w) > max_chars:
+                    out.append(cur); cur = w
+                else:
+                    cur = (cur + " " + w).strip()
+            if cur:
+                out.append(cur)
+    return out or [text]
+
+def build_dub_subcues(chunks):
+    """Split each chunk's translated text into subtitle lines, timed across
+    the chunk's PLACED window [pos, pos+spoken] — so subs match the dub."""
+    cues = []
+    for c in chunks:
+        pos = c.get("pos", c["start"]); dur = max(0.3, c.get("spoken", c["dur"]))
+        parts = _split_lines(c["en"])
+        total = sum(len(p) for p in parts) or 1
+        t = pos
+        for p in parts:
+            d = dur * len(p) / total
+            cues.append({"start": t, "end": t + d, "text": p})
+            t += d
+    return cues
+
+def _srt_ts(t):
+    h = int(t // 3600); m = int(t % 3600 // 60); s = int(t % 60); ms = int(round((t - int(t)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def write_srt(cues, path):
+    with open(path, "w") as f:
+        for n, c in enumerate(cues, 1):
+            f.write(f"{n}\n{_srt_ts(c['start'])} --> {_srt_ts(c['end'])}\n{c['text']}\n\n")
+
+
+# ── 9. mux / burn ───────────────────────────────────────────────────
+def mux(video, track, out, orig_vol=0.0):
+    """Mux dubbed track into video. If orig_vol > 0, mix original audio at that
+    volume level (e.g. 0.08 = 8%) under the dubbed track."""
+    if orig_vol > 0.01:
+        ff(["-i", video, "-i", track,
+            "-filter_complex",
+            f"[0:a]volume={orig_vol:.2f}[orig];[1:a]volume=1.0[dub];[orig][dub]amix=inputs=2:duration=longest:normalize=0[out]",
+            "-map", "0:v:0", "-map", "[out]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out])
+    else:
+        ff(["-i", video, "-i", track, "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out])
+
+def _has_subtitles_filter():
+    try:
+        out = subprocess.check_output(["ffmpeg", "-hide_banner", "-filters"],
+                                      stderr=subprocess.DEVNULL).decode()
+        return bool(re.search(r"^\s*\S*\s+subtitles\b", out, re.M))
+    except Exception:
+        return False
+
+def _video_dims(video):
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=p=0:s=x", video]).decode().strip()
+        w, h = out.split("x")
+        return int(w), int(h)
+    except Exception:
+        return 1920, 1080
+
+def burn(video, track, srt_path, out, orig_vol=0.0):
+    if not _has_subtitles_filter():
+        return False
+    w, h = _video_dims(video)
+    # Small, clean caption like professional vietsub — ~1.3% of short side
+    short_side = min(w, h)
+    font_size = max(8, min(14, int(short_side * 0.013)))
+    margin_v = max(10, int(h * 0.02))
+    style = (f"FontName=Arial,FontSize={font_size},PrimaryColour=&H00FFFFFF,"
+             f"BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,"
+             f"MarginV={margin_v},Alignment=2,Bold=0")
+    if orig_vol > 0.01:
+        af = (f"[0:a]volume={orig_vol:.2f}[orig];[1:a]volume=1.0[dub];"
+              "[orig][dub]amix=inputs=2:duration=longest:normalize=0[out]")
+        ff(["-i", video, "-i", track,
+            "-filter_complex", af,
+            "-map", "0:v:0", "-map", "[out]",
+            "-vf", f"subtitles={srt_path}:force_style='{style}'",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", out])
+    else:
+        ff(["-i", video, "-i", track, "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", f"subtitles={srt_path}:force_style='{style}'",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", out])
+    return True
+
+
+def main():
+    cfg = json.load(open(sys.argv[1]))
+    video = cfg["video"]
+    total_dur = ffprobe_dur(video)
+    workdir = tempfile.mkdtemp(prefix="dub-")
+    try:
+        log(f"source: {os.path.basename(video)} ({total_dur:.1f}s) | mode={cfg['mode']} | tts={cfg['tts']} | voice={cfg['voice']}")
+        audio = extract_audio(video, workdir)
+        segs, lang = transcribe(cfg, audio)
+        if cfg.get("source_lang", "auto") == "auto":
+            cfg["source_lang"] = lang
+        log(f"transcribed: {len(segs)} segments, source language={cfg['source_lang']}")
+        chunks = chunk_segments(segs, max_dur=cfg.get("chunk_sec", 22.0))
+        if not chunks:
+            die("no speech chunks to dub")
+        log(f"grouped into {len(chunks)} chunks")
+        chunks = translate(cfg, chunks)
+        engine = lock_engine(cfg)
+        max_speed = cfg.get("max_speed", DEFAULT_MAX_SPEED)
+        for c in chunks:
+            raw = os.path.join(workdir, f"raw_{c['i']}.mp3")
+            synth_chunk(cfg, engine, c["en"], raw)
+            c["fit"] = os.path.join(workdir, f"fit_{c['i']}.wav")
+            speed, spoken = speed_fit(raw, c["dur"], max_speed, c["fit"])
+            c["spoken"] = spoken
+            tag = f"speed={speed:.2f}" if speed > 1.0 else f"+{c['dur'] - spoken:.1f}s pause"
+            log(f"  chunk {c['i']:>2} slot={c['dur']:>5.1f}s spoken={spoken:>5.1f}s {tag}")
+        track = assemble(chunks, total_dur, workdir)
+        orig_vol = cfg.get("orig_vol", 0.0)
+        if cfg.get("bilingual"):
+            bcues = bl.bilingual_cues(cfg, segs)
+            W, H = bl.video_dims(video)
+            ass = os.path.join(workdir, "bilingual.ass")
+            bl.write_ass(bcues, ass, W, H)
+            ff_bin = bl.resolve_libass_ffmpeg()
+            if cfg.get("burn") and ff_bin:
+                log("burning bilingual subtitles into the dubbed video (re-encoding)…")
+                bl.burn_ass(ff_bin, video, ass, cfg["out"], audio_track=track)
+            else:
+                out_ass = os.path.splitext(cfg["out"])[0] + ".ass"
+                bl.write_ass(bcues, out_ass, W, H)
+                mux(video, track, cfg["out"], orig_vol=orig_vol)
+                log(f"bilingual subtitles -> {out_ass}")
+        elif cfg.get("burn") or cfg.get("srt"):
+            cues = build_dub_subcues(chunks)
+            if cfg.get("srt"):
+                out_srt = os.path.splitext(cfg["out"])[0] + ".srt"
+                write_srt(cues, out_srt); log(f"subtitles -> {out_srt}")
+            if cfg.get("burn"):
+                wsrt = os.path.join(workdir, "subs.srt"); write_srt(cues, wsrt)
+                log("burning captions into video (white text, black bg)…")
+                if not burn(video, track, wsrt, cfg["out"], orig_vol=orig_vol):
+                    out_srt = os.path.splitext(cfg["out"])[0] + ".srt"
+                    write_srt(cues, out_srt)
+                    mux(video, track, cfg["out"], orig_vol=orig_vol)
+                    log("note: ffmpeg without libass — wrote .srt instead of burning.")
+            else:
+                mux(video, track, cfg["out"], orig_vol=orig_vol)
+        else:
+            mux(video, track, cfg["out"], orig_vol=orig_vol)
+        log(f"done -> {cfg['out']}")
+        print(cfg["out"])
+    finally:
+        if not cfg.get("keep_temp"):
+            shutil.rmtree(workdir, ignore_errors=True)
+        else:
+            log(f"temp kept at {workdir}")
+
+
+if __name__ == "__main__":
+    main()
