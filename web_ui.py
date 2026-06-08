@@ -7,6 +7,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file, Response
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
 
 def _load_kyma_env():
     candidates = [Path(".env"), Path.home() / ".config/kyma-dub/env", Path.home() / "kyma-api/.env"]
@@ -89,11 +90,11 @@ def run_job(job_id: str, input_path: str, to_lang: str, voice: str, model: str):
     try:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(PIPELINE.parent)
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
-        for line in proc.stderr:
-            update(line.rstrip())
+        proc = subprocess.Popen(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
         for line in proc.stdout:
-            update(line.rstrip())
+            line = line.rstrip()
+            print(f"[job:{job_id}] {line}", flush=True)  # show in Railway logs
+            update(line)
         proc.wait()
         if proc.returncode == 0 and out_path.exists():
             with JOBS_LOCK:
